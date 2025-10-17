@@ -1,0 +1,22 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.egg-info/
+.venv/
+venv/
+env/
+
+# Streamlit / app artifacts
+logs/
+vt_cache.json
+.streamlit/
+
+# OS / editor
+.DS_Store
+Thumbs.db
+
+# Env files (if you ever add them)
+.env
+*.env
