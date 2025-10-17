@@ -759,7 +759,7 @@ for alert in st.session_state.alerts:
             st.session_state.results.pop(aid, None)
             st.session_state.workflow.pop(aid, None)
             st.info("Cleared triage & workflow state for this alert.")
-            st.stop()
+            st.rerun()  # <-- FIX: rerun instead of stop so the rest of the page persists
 
         # Show AI outputs + workflow controls
         tri = st.session_state.results.get(aid)
@@ -903,6 +903,7 @@ if todo_rows:
     st.dataframe(pd.DataFrame(todo_rows), use_container_width=True)
 else:
     st.info("No items require human action right now ✅")
+
 
 
 
