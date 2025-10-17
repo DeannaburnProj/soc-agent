@@ -1,3 +1,23 @@
+import streamlit as st
+
+# --- Landing Section ---
+st.set_page_config(page_title="SOC Analyst AI Assistant", page_icon="🧠", layout="wide")
+
+st.title("AI-Powered SOC Analyst Assistant")
+st.markdown("""
+Welcome to the **SOC Analyst AI Assistant** — a demonstration of how artificial intelligence 
+can augment Tier-1 Security Operations workflows.
+
+This dashboard:
+- Simulates real-world SOC alerts  
+- Enriches indicators using **VirusTotal**  
+- Performs AI-driven triage via **OpenAI**  
+- Keeps a **human analyst in control** through approvals and escalation logic  
+
+Use the sidebar to manage API keys, view system status, or toggle auto-triage.
+""")
+st.divider()
+
 # dashboard.py — SOC Tier-1 Interactive Analyst Console
 # Features: VT enrichment (IP/Domain/Hash), AI triage (strict schema), guardrails,
 # approval workflow, auto-triage, sample packs, CSV upload, VT cache, human workload panel.
