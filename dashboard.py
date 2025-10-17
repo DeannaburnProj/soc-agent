@@ -1,38 +1,19 @@
 # dashboard.py — SOC Tier-1 Interactive Analyst Console
 # Features: VT enrichment (IP/Domain/Hash), AI triage (strict schema), guardrails,
-# approval workflow, auto-triage, sample packs, CSV upload, VT cache, human workload panel,
-# escalation workflow with queue & badges, closed alerts panel.
+# approval workflow, auto-triage, sample packs, CSV upload, VT cache,
+# and TOP "Human Oversight Dashboard" with counters + expandable lists + jump-to.
 
 import os
 import json
 import re
 import time
 from typing import Dict, Any, List, Tuple
+from functools import lru_cache  # NEW: in-process cache
 
 import pandas as pd
 import requests
 import streamlit as st
 from openai import OpenAI
-
-# =========================
-# PAGE CONFIG + LANDING
-# =========================
-st.set_page_config(page_title="SOC Analyst AI Assistant", page_icon="🧠", layout="wide")
-
-st.title("AI-Powered SOC Analyst Assistant")
-st.markdown("""
-Welcome to the **SOC Analyst AI Assistant** — a demonstration of how artificial intelligence 
-can augment Tier-1 Security Operations workflows.
-
-This dashboard:
-- Simulates real-world SOC alerts  
-- Enriches indicators using **VirusTotal**  
-- Performs AI-driven triage via **OpenAI**  
-- Keeps a **human analyst in control** through approvals and escalation logic  
-
-Use the sidebar to manage options, load sample alerts, or upload a CSV.
-""")
-st.divider()
 
 # =========================
 # CONFIG
@@ -41,15 +22,6 @@ MODEL_NAME = "gpt-4o-mini"
 OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY")
 VT_API_KEY = os.environ.get("VT_API_KEY")
 client = OpenAI(api_key=OPENAI_API_KEY) if OPENAI_API_KEY else None
-
-def now_ts() -> int:
-    return int(time.time())
-
-def fmt_ts(ts: int) -> str:
-    try:
-        return time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(ts))
-    except Exception:
-        return str(ts)
 
 # =========================
 # VT Cache (reduce rate limits)
@@ -70,13 +42,6 @@ def save_vt_cache():
             json.dump(VT_CACHE, f)
     except Exception:
         pass
-
-def cache_get(key: str):
-    return VT_CACHE.get(key)
-
-def cache_set(key: str, value: dict):
-    VT_CACHE[key] = value
-    save_vt_cache()
 
 # =========================
 # Sample Alerts (rich set)
@@ -292,6 +257,13 @@ HASH_RE = re.compile(r"^[A-Fa-f0-9]{32}$|^[A-Fa-f0-9]{40}$|^[A-Fa-f0-9]{64}$")
 def vt_headers() -> Dict[str, str]:
     return {"Accept": "application/json", "x-apikey": VT_API_KEY}
 
+def cache_get(key: str):
+    return VT_CACHE.get(key)
+
+def cache_set(key: str, value: dict):
+    VT_CACHE[key] = value
+    save_vt_cache()
+
 def vt_map_reputation(stats: dict) -> str:
     malicious = int(stats.get("malicious", 0))
     suspicious = int(stats.get("suspicious", 0))
@@ -301,15 +273,17 @@ def vt_map_reputation(stats: dict) -> str:
         return "suspicious"
     return "clean"
 
+# NEW: in-process cache on top of file cache
+@lru_cache(maxsize=2048)
 def vt_enrich_ip(ip: str) -> Dict[str, Any]:
     if not ip:
-        return {"status": "no_ip", "reputation": "unknown", "malicious": None, "suspicious": None, "harmless": None, "message": "No IP provided", "raw": {}}
+        return {"status": "no_ip", "reputation": "unknown", "malicious": None, "suspicious": None, "harmless": None, "raw": {}}
     key = f"ip::{ip}"
     cached = cache_get(key)
     if cached:
         return cached
     if not VT_API_KEY:
-        res = {"status": "disabled", "reputation": "unknown", "malicious": None, "suspicious": None, "harmless": None, "message": "VirusTotal key missing", "raw": {}}
+        res = {"status": "disabled", "reputation": "unknown", "malicious": None, "suspicious": None, "harmless": None, "raw": {}}
         cache_set(key, res); return res
     url = f"https://www.virustotal.com/api/v3/ip_addresses/{ip}"
     try:
@@ -323,28 +297,28 @@ def vt_enrich_ip(ip: str) -> Dict[str, Any]:
                 "malicious": int(stats.get("malicious", 0)),
                 "suspicious": int(stats.get("suspicious", 0)),
                 "harmless": int(stats.get("harmless", 0)),
-                "message": "Enrichment successful",
                 "raw": data
             }
         elif r.status_code == 429:
-            res = {"status": "rate_limited", "reputation": "unknown", "malicious": None, "suspicious": None, "harmless": None, "message": "Rate limit reached — please retry in ~1 minute.", "raw": {}}
+            res = {"status": "rate_limited", "reputation": "unknown", "malicious": None, "suspicious": None, "harmless": None, "raw": {}}
         else:
-            res = {"status": f"error_{r.status_code}", "reputation": "unknown", "malicious": None, "suspicious": None, "harmless": None, "message": f"VirusTotal API error ({r.status_code})", "raw": {}}
+            res = {"status": f"error_{r.status_code}", "reputation": "unknown", "malicious": None, "suspicious": None, "harmless": None, "raw": {}}
     except requests.Timeout:
-        res = {"status": "error_timeout", "reputation": "unknown", "malicious": None, "suspicious": None, "harmless": None, "message": "Network timeout — please retry.", "raw": {}}
-    except Exception:
-        res = {"status": "error", "reputation": "unknown", "malicious": None, "suspicious": None, "harmless": None, "message": "Unexpected error — please retry.", "raw": {}}
+        res = {"status": "error_timeout", "reputation": "unknown", "malicious": None, "suspicious": None, "harmless": None, "raw": {}}
+    except Exception as e:
+        res = {"status": f"error_{type(e).__name__}", "reputation": "unknown", "malicious": None, "suspicious": None, "harmless": None, "raw": {}}
     cache_set(key, res); return res
 
+@lru_cache(maxsize=2048)
 def vt_enrich_domain(domain: str) -> Dict[str, Any]:
     if not domain:
-        return {"status": "no_domain", "reputation": "unknown", "malicious": None, "suspicious": None, "harmless": None, "message": "No domain provided", "raw": {}}
+        return {"status": "no_domain", "reputation": "unknown", "malicious": None, "suspicious": None, "harmless": None, "raw": {}}
     key = f"domain::{domain.lower()}"
     cached = cache_get(key)
     if cached:
         return cached
     if not VT_API_KEY:
-        res = {"status": "disabled", "reputation": "unknown", "malicious": None, "suspicious": None, "harmless": None, "message": "VirusTotal key missing", "raw": {}}
+        res = {"status": "disabled", "reputation": "unknown", "malicious": None, "suspicious": None, "harmless": None, "raw": {}}
         cache_set(key, res); return res
     url = f"https://www.virustotal.com/api/v3/domains/{domain}"
     try:
@@ -358,29 +332,29 @@ def vt_enrich_domain(domain: str) -> Dict[str, Any]:
                 "malicious": int(stats.get("malicious", 0)),
                 "suspicious": int(stats.get("suspicious", 0)),
                 "harmless": int(stats.get("harmless", 0)),
-                "message": "Enrichment successful",
                 "raw": data
             }
         elif r.status_code == 429:
-            res = {"status": "rate_limited", "reputation": "unknown", "malicious": None, "suspicious": None, "harmless": None, "message": "Rate limit reached — please retry in ~1 minute.", "raw": {}}
+            res = {"status": "rate_limited", "reputation": "unknown", "malicious": None, "suspicious": None, "harmless": None, "raw": {}}
         else:
-            res = {"status": f"error_{r.status_code}", "reputation": "unknown", "malicious": None, "suspicious": None, "harmless": None, "message": f"VirusTotal API error ({r.status_code})", "raw": {}}
+            res = {"status": f"error_{r.status_code}", "reputation": "unknown", "malicious": None, "suspicious": None, "harmless": None, "raw": {}}
     except requests.Timeout:
-        res = {"status": "error_timeout", "reputation": "unknown", "malicious": None, "suspicious": None, "harmless": None, "message": "Network timeout — please retry.", "raw": {}}
-    except Exception:
-        res = {"status": "error", "reputation": "unknown", "malicious": None, "suspicious": None, "harmless": None, "message": "Unexpected error — please retry.", "raw": {}}
+        res = {"status": "error_timeout", "reputation": "unknown", "malicious": None, "suspicious": None, "harmless": None, "raw": {}}
+    except Exception as e:
+        res = {"status": f"error_{type(e).__name__}", "reputation": "unknown", "malicious": None, "suspicious": None, "harmless": None, "raw": {}}
     cache_set(key, res); return res
 
+@lru_cache(maxsize=2048)
 def vt_enrich_hash(hash_value: str) -> Dict[str, Any]:
     if not hash_value or not HASH_RE.match(hash_value.strip()):
-        return {"status": "no_hash", "reputation": "unknown", "malicious": None, "suspicious": None, "harmless": None, "message": "No valid hash provided", "raw": {}}
+        return {"status": "no_hash", "reputation": "unknown", "malicious": None, "suspicious": None, "harmless": None, "raw": {}}
     hv = hash_value.strip().lower()
     key = f"hash::{hv}"
     cached = cache_get(key)
     if cached:
         return cached
     if not VT_API_KEY:
-        res = {"status": "disabled", "reputation": "unknown", "malicious": None, "suspicious": None, "harmless": None, "message": "VirusTotal key missing", "raw": {}}
+        res = {"status": "disabled", "reputation": "unknown", "malicious": None, "suspicious": None, "harmless": None, "raw": {}}
         cache_set(key, res); return res
     url = f"https://www.virustotal.com/api/v3/files/{hv}"
     try:
@@ -394,19 +368,18 @@ def vt_enrich_hash(hash_value: str) -> Dict[str, Any]:
                 "malicious": int(stats.get("malicious", 0)),
                 "suspicious": int(stats.get("suspicious", 0)),
                 "harmless": int(stats.get("harmless", 0)),
-                "message": "Enrichment successful",
                 "raw": data
             }
         elif r.status_code == 404:
-            res = {"status": "not_found", "reputation": "unknown", "malicious": 0, "suspicious": 0, "harmless": 0, "message": "Hash not found on VirusTotal", "raw": {}}
+            res = {"status": "not_found", "reputation": "unknown", "malicious": 0, "suspicious": 0, "harmless": 0, "raw": {}}
         elif r.status_code == 429:
-            res = {"status": "rate_limited", "reputation": "unknown", "malicious": None, "suspicious": None, "harmless": None, "message": "Rate limit reached — please retry in ~1 minute.", "raw": {}}
+            res = {"status": "rate_limited", "reputation": "unknown", "malicious": None, "suspicious": None, "harmless": None, "raw": {}}
         else:
-            res = {"status": f"error_{r.status_code}", "reputation": "unknown", "malicious": None, "suspicious": None, "harmless": None, "message": f"VirusTotal API error ({r.status_code})", "raw": {}}
+            res = {"status": f"error_{r.status_code}", "reputation": "unknown", "malicious": None, "suspicious": None, "harmless": None, "raw": {}}
     except requests.Timeout:
-        res = {"status": "error_timeout", "reputation": "unknown", "malicious": None, "suspicious": None, "harmless": None, "message": "Network timeout — please retry.", "raw": {}}
-    except Exception:
-        res = {"status": "error", "reputation": "unknown", "malicious": None, "suspicious": None, "harmless": None, "message": "Unexpected error — please retry.", "raw": {}}
+        res = {"status": "error_timeout", "reputation": "unknown", "malicious": None, "suspicious": None, "harmless": None, "raw": {}}
+    except Exception as e:
+        res = {"status": f"error_{type(e).__name__}", "reputation": "unknown", "malicious": None, "suspicious": None, "harmless": None, "raw": {}}
     cache_set(key, res); return res
 
 # =========================
@@ -555,24 +528,106 @@ def ai_triage(alert: Dict[str, Any], ip_rep: str, domain_rep: str, hash_rep: str
     return tri
 
 # =========================
-# Status badge helper
-# =========================
-def status_badge(status: str, escalated: bool) -> str:
-    s = (status or "New").lower()
-    if s == "closed":
-        return "Status: :green[**CLOSED**]"
-    if escalated or s == "escalated":
-        return "Status: :red[**ESCALATED**]"
-    if s == "awaiting approval":
-        return "Status: :orange[**AWAITING APPROVAL**]"
-    if s == "triaged":
-        return "Status: :blue[**TRIAGED**]"
-    return "Status: :gray[**NEW**]"
-
-# =========================
 # STREAMLIT UI (Interactive Analyst Console)
 # =========================
-st.title("Tier-1 SOC Agent — Interactive Console")
+st.set_page_config(page_title="SOC Agent Console", layout="wide")
+
+# Column weights used for header/rows (keeps alignment consistent)
+COLS_WEIGHTS = [0.9, 3.0, 1.1, 1.1, 1.1, 1.1]
+
+# --- Topbar (centered title above intro card) ---
+st.markdown("""
+<style>
+.topbar-center {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  text-align: center;
+  max-width: 900px;
+  margin: 1.5rem auto 1rem auto;
+  padding: 0 1rem;
+}
+
+/* Title styling */
+.topbar-center .title {
+  font-size: 2.6rem;
+  font-weight: 850;
+  line-height: 1.25;
+  margin-bottom: 0.8rem;
+  letter-spacing: .3px;
+}
+
+/* Description card */
+.intro-card {
+  background: rgba(245,246,248,0.9);
+  border: 1px solid rgba(0,0,0,.06);
+  border-radius: 16px;
+  padding: 1rem 1.4rem 1.1rem 1.4rem;
+  box-shadow: 0 2px 4px rgba(0,0,0,.06);
+  backdrop-filter: blur(3px);
+  max-width: 680px;
+}
+.intro-card .intro-title {
+  font-weight: 700;
+  font-size: 1.15rem;
+  margin: 0 0 .5rem 0;
+}
+.intro-card .intro-text {
+  margin: 0 0 .4rem 0;
+  line-height: 1.45;
+}
+.intro-card ul {
+  list-style-type: disc;
+  padding-left: 1.4rem;
+  margin: .5rem 0 .6rem 0;
+  text-align: left;
+  line-height: 1.55;
+}
+.intro-card li {
+  margin: .2rem 0;
+  font-size: .97rem;
+}
+
+/* Subtle bullet color for dark theme */
+@media (prefers-color-scheme: dark){
+  .intro-card {
+    background: rgba(34,37,42,.45);
+    border-color: rgba(255,255,255,.15);
+    box-shadow: 0 2px 5px rgba(0,0,0,.4);
+  }
+  .intro-card ul { color: rgba(255,255,255,.9); }
+  .intro-card li::marker { color: rgba(255,255,255,.55); }
+}
+
+/* Responsive adjustments */
+@media (max-width: 900px){
+  .topbar-center .title {
+    font-size: 1.9rem;
+    font-weight: 750;
+  }
+  .intro-card { padding: .9rem 1.1rem; }
+}
+</style>
+
+<div class="topbar-center">
+  <div class="title">Tier-1 SOC Agent — Interactive Console</div>
+  <div class="intro-card">
+    <div class="intro-title">AI-Powered SOC Analyst Assistant</div>
+    <p class="intro-text">
+      Welcome to the SOC Analyst AI Assistant — a demonstration of how artificial intelligence can augment Tier-1 Security Operations workflows. This dashboard:
+    </p>
+    <ul>
+      <li>Simulates real-world SOC alerts</li>
+      <li>Enriches indicators using VirusTotal</li>
+      <li>Performs AI-driven triage via OpenAI</li>
+      <li>Keeps a human analyst in control through approvals and escalation logic</li>
+    </ul>
+    <p class="intro-text" style="font-size:.92rem;opacity:.9;">
+      Use the sidebar to manage options, load sample alerts, or upload a CSV.
+    </p>
+  </div>
+</div>
+""", unsafe_allow_html=True)
 
 # Sidebar: environment + mode + bulk features
 st.sidebar.header("Environment")
@@ -605,13 +660,26 @@ uploaded = st.sidebar.file_uploader(
     type=["csv"],
     help="Columns supported: alert_id, alert_name, hostname, ip, domain, hash, user, details"
 )
+
+# Safe CSV handling (prevents weird uploads from breaking state) + size cap
+required_cols = {"alert_id", "alert_name", "hostname", "ip", "domain", "hash", "user", "details"}
+MAX_UPLOAD_BYTES = 4 * 1024 * 1024  # 4 MB
 if uploaded:
-    df_up = pd.read_csv(uploaded)
-    df_up.fillna("", inplace=True)
-    new_alerts = df_up.to_dict(orient="records")
-    st.session_state.setdefault("alerts", [])
-    st.session_state["alerts"].extend(new_alerts)
-    st.sidebar.success(f"Loaded {len(new_alerts)} alerts from CSV")
+    if getattr(uploaded, "size", 0) > MAX_UPLOAD_BYTES:
+        st.sidebar.error("CSV too large (max 4 MB).")
+    else:
+        try:
+            df_up = pd.read_csv(uploaded).fillna("")
+            missing = required_cols - set(df_up.columns)
+            if missing:
+                st.sidebar.error(f"Uploaded CSV missing columns: {', '.join(sorted(missing))}")
+            else:
+                new_alerts = df_up.to_dict(orient="records")
+                st.session_state.setdefault("alerts", [])
+                st.session_state["alerts"].extend(new_alerts)
+                st.sidebar.success(f"Loaded {len(new_alerts)} alerts from CSV")
+        except Exception as e:
+            st.sidebar.error(f"Failed to read CSV: {e}")
 
 # Session state init
 if "alerts" not in st.session_state:
@@ -619,31 +687,249 @@ if "alerts" not in st.session_state:
 if "results" not in st.session_state:
     st.session_state.results: Dict[str, Dict[str, Any]] = {}
 if "workflow" not in st.session_state:
-    # alert_id -> {status, owner, notes[], checklist{action: done}, escalated, escalation_*}
+    # alert_id -> {status, owner, notes[], checklist{action: done}}
     st.session_state.workflow: Dict[str, Dict[str, Any]] = {}
 
-# Human workload overview
-def workload_summary():
-    total = len(st.session_state.alerts)
-    triaged = sum(1 for aid in st.session_state.workflow if st.session_state.workflow[aid].get("status") in ["Triaged","Awaiting Approval","Escalated","Closed"])
-    awaiting = sum(1 for aid in st.session_state.workflow if st.session_state.workflow[aid].get("status") == "Awaiting Approval")
-    escalated = sum(1 for aid in st.session_state.workflow if st.session_state.workflow[aid].get("status") == "Escalated")
-    closed = sum(1 for aid in st.session_state.workflow if st.session_state.workflow[aid].get("status") == "Closed")
-    return total, triaged, awaiting, escalated, closed
+# ---------- Top dashboard categorization helpers ----------
+def _row(alert_id: str, tri: Dict[str, Any], wf: Dict[str, Any]) -> Dict[str, Any]:
+    return {
+        "alert_id": alert_id,
+        "name": next((a["alert_name"] for a in st.session_state.alerts if a["alert_id"] == alert_id), ""),
+        "severity": tri.get("severity", "medium").upper(),
+        "confidence": tri.get("confidence", 0),
+        "status": wf.get("status", "New"),
+        "summary": (tri.get("summary") or "")[:140] + ("…" if len(tri.get("summary","")) > 140 else "")
+    }
 
-st.subheader("Human Workload Overview")
-t_total, t_triaged, t_await, t_escal, t_closed = workload_summary()
-c1, c2, c3, c4, c5 = st.columns(5)
-c1.metric("Total Alerts", t_total)
-c2.metric("AI Triaged", t_triaged)
-c3.metric("Awaiting Approval", t_await)
-c4.metric("Escalated", t_escal)
-c5.metric("Closed", t_closed)
+def build_sets():
+    results = st.session_state.results
+    wf_all = st.session_state.workflow
+
+    escalations, awaiting, needs_human, closed = [], [], [], []
+
+    for aid, tri in results.items():
+        wf = wf_all.get(aid, {})
+        if tri.get("escalate"):
+            escalations.append(_row(aid, tri, wf))
+        if wf.get("status") == "Awaiting Approval" or tri.get("approval_needed"):
+            awaiting.append(_row(aid, tri, wf))
+        open_tasks = sum(1 for x in wf.get("checklist", {}).values() if not x)
+        if tri.get("approval_needed") or wf.get("status") == "Awaiting Approval" or tri.get("escalate") or open_tasks > 0:
+            needs_human.append(_row(aid, tri, wf))
+        if wf.get("status") == "Closed":
+            closed.append(_row(aid, tri, wf))
+    return escalations, awaiting, needs_human, closed
+
+# =========================
+# Human Oversight Dashboard (TOP)
+# =========================
+st.markdown("""
+<style>
+/* Keep the tight layout but ensure the main title isn't clipped */
+div.block-container h1:first-child { margin-top: .6rem !important; }
+
+/* Section title + sub */
+.hod-title { font-size: 1.6rem; font-weight: 700; margin: 0 0 .3rem 0; }
+.hod-sub { color: rgba(0,0,0,.65); margin-bottom: .6rem; }
+
+/* Cards row and styling */
+.hod-cards { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: .75rem; margin-bottom: .6rem; }
+.hod-card {
+  border: 1px solid rgba(0,0,0,.06) !important;
+  border-radius: 14px !important;
+  padding: .9rem .9rem !important;
+  background: rgba(245,246,248,0.9) !important;
+  box-shadow: 0 1px 3px rgba(0,0,0,.05) !important;
+  backdrop-filter: blur(3px) !important;
+}
+.hod-card:hover {
+  background: rgba(237,239,242,1) !important;
+  box-shadow: 0 2px 5px rgba(0,0,0,.08) !important;
+}
+
+/* Card labels & chips */
+.hod-label { font-weight: 600; font-size: .95rem; display: flex; align-items: center; gap: .55rem; color: rgba(0,0,0,.88) !important; }  /* gap tweaked */
+.hod-chip { display:inline-block; padding:.22rem .62rem; border-radius:999px; font-weight:700; font-size:.9rem; border:1px solid transparent; }  /* padding tweaked */
+.hod-chip-esc  { background: rgba(239,68,68,.14) !important;  color: #7f1d1d !important; border-color: rgba(239,68,68,.38) !important; }
+.hod-chip-apr  { background: rgba(245,158,11,.16) !important; color: #7c2d12 !important; border-color: rgba(245,158,11,.40) !important; }
+.hod-chip-need { background: rgba(59,130,246,.14) !important;  color: #1e3a8a !important; border-color: rgba(59,130,246,.38) !important; }
+.hod-chip-clo  { background: rgba(16,185,129,.14) !important;  color: #065f46 !important; border-color: rgba(16,185,129,.38) !important; }
+
+.hod-note { color: rgba(0,0,0,.62) !important; }
+
+/* Badges */
+.hod-badge { display:inline-block; padding:.1rem .45rem; border-radius:10px; font-size:.80rem; font-weight:700; }
+.badge-sev-CRITICAL { background:#ef4444; color:white; }
+.badge-sev-HIGH     { background:#f97316; color:white; }
+.badge-sev-MEDIUM   { background:#f59e0b; color:white; }
+.badge-sev-LOW      { background:#10b981; color:white; }
+.badge-sts { background:rgba(0,0,0,.08) !important; color:rgba(0,0,0,.85) !important; }
+
+/* Make ALL text inside the tabbed lists readable by default */
+.hod-list, .hod-list * { color: rgba(0,0,0,.90) !important; }
+@media (prefers-color-scheme: dark) {
+  .hod-list, .hod-list * { color: rgba(255,255,255,.92) !important; }
+  .badge-sts { background: rgba(255,255,255,.16) !important; color: rgba(255,255,255,.92) !important; }
+}
+
+/* Left-side cells readability */
+.hod-sum, .hod-sum * { color: rgba(0,0,0,.92) !important; }
+@media (prefers-color-scheme: dark) {
+  .hod-sum, .hod-sum * { color: rgba(255,255,255,.92) !important; }
+}
+</style>
+""", unsafe_allow_html=True)
+
+st.markdown('<div class="hod-title">Human Oversight Dashboard</div>', unsafe_allow_html=True)
+
+esc, await_appr, needs, closed = build_sets()
+
+# Cards row
+c1, c2, c3, c4 = st.columns(4)
+with c1:
+    st.markdown(f"""
+    <div class="hod-card">
+      <div class="hod-label">⚠️ Escalations <span class="hod-chip hod-chip-esc">{len(esc)}</span></div>
+      <div class="hod-note">High/critical or flagged cases.</div>
+    </div>
+    """, unsafe_allow_html=True)
+with c2:
+    st.markdown(f"""
+    <div class="hod-card">
+      <div class="hod-label">📝 Awaiting Approval <span class="hod-chip hod-chip-apr">{len(await_appr)}</span></div>
+      <div class="hod-note">Actions pending analyst approval.</div>
+    </div>
+    """, unsafe_allow_html=True)
+with c3:
+    st.markdown(f"""
+    <div class="hod-card">
+      <div class="hod-label">👀 Needs Review <span class="hod-chip hod-chip-need">{len(needs)}</span></div>
+      <div class="hod-note">Open tasks, approvals, or escalations.</div>
+    </div>
+    """, unsafe_allow_html=True)
+with c4:
+    st.markdown(f"""
+    <div class="hod-card">
+      <div class="hod-label">✅ Closed <span class="hod-chip hod-chip-clo">{len(closed)}</span></div>
+      <div class="hod-note">Resolved alerts (for reference).</div>
+    </div>
+    """, unsafe_allow_html=True)
+
+# ---------- Tabbed lists with compact rows + jump buttons ----------
+tab1, tab2, tab3, tab4 = st.tabs([
+    f"Escalations ({len(esc)})",
+    f"Awaiting Approval ({len(await_appr)})",
+    f"Needs Review ({len(needs)})",   # Consistent naming
+    f"Closed ({len(closed)})"
+])
+
+def _sev_badge(sev: str) -> str:
+    sev = (sev or "MEDIUM").upper()
+    cls = "badge-sev-" + ("CRITICAL" if sev == "CRITICAL" else "HIGH" if sev == "HIGH" else "LOW" if sev == "LOW" else "MEDIUM")
+    return f'<span class="hod-badge {cls}">{sev}</span>'
+
+def _sts_badge(sts: str) -> str:
+    return f'<span class="hod-badge badge-sts">{(sts or "New")}</span>'
+
+def _list_block(rows: List[Dict[str, Any]], key_prefix: str):
+    if not rows:
+        st.info("Nothing here. ✅")
+        return
+
+    # Optional: sort rows by severity then confidence (CRITICAL > HIGH > MEDIUM > LOW)
+    sev_rank = {"CRITICAL": 3, "HIGH": 2, "MEDIUM": 1, "LOW": 0}
+    rows = sorted(
+        rows,
+        key=lambda r: (sev_rank.get((r.get("severity") or "MEDIUM").upper(), 1), r.get("confidence", 0)),
+        reverse=True
+    )
+
+    # Start wrapper
+    st.markdown('<div class="hod-list">', unsafe_allow_html=True)
+
+    # Header (uses same Streamlit column widths)
+    header_cols = st.columns(COLS_WEIGHTS, gap="small")
+    header_cols[0].markdown("**ID**")
+    header_cols[1].markdown("**Name**")
+    header_cols[2].markdown("**Severity**")
+    header_cols[3].markdown("**Confidence**")
+    header_cols[4].markdown("**Status**")
+    header_cols[5].markdown("**Action**")
+
+    # Thin separator
+    st.markdown(
+        '<div style="height:8px;border-bottom:1px solid rgba(0,0,0,.08);margin:.2rem 0 .4rem 0;"></div>',
+        unsafe_allow_html=True
+    )
+
+    # Rows (unique keys)
+    for i, r in enumerate(rows):
+        sev_html = _sev_badge(r.get("severity"))
+        sts_html = _sts_badge(r.get("status"))
+
+        with st.container(border=False):
+            cols = st.columns(COLS_WEIGHTS, gap="small")
+            cols[0].markdown(f"<div class='hod-sum'><b>{r['alert_id']}</b></div>", unsafe_allow_html=True)
+            cols[1].markdown(f"<div class='hod-sum'>{r.get('name','')}</div>", unsafe_allow_html=True)
+            cols[2].markdown(sev_html, unsafe_allow_html=True)
+            cols[3].markdown(f"{r.get('confidence',0)}%", unsafe_allow_html=True)
+            cols[4].markdown(sts_html, unsafe_allow_html=True)
+
+            btn_key = f"{key_prefix}_{i}_{r['alert_id']}_open"
+            if cols[5].button("Open", key=btn_key):
+                st.session_state["jump_to"] = r["alert_id"]
+                st.toast(f"Opening alert {r['alert_id']}…")
+
+    # Close wrapper
+    st.markdown('</div>', unsafe_allow_html=True)
+
+# ---- Render the tab contents ----
+with tab1: _list_block(esc, "esc")
+with tab2: _list_block(await_appr, "apr")
+with tab3: _list_block(needs, "need")
+with tab4: _list_block(closed, "clo")
+
+# --- Incoming Alerts (header + right-aligned 'Run All' button) ---
+h1, h2 = st.columns([1, 0.32])  # tweak 0.32 -> 0.25 for a tighter button
+with h1:
+    st.subheader("Incoming Alerts")
+with h2:
+    run_all = st.button(
+        "🔎 Run AI Triage on All",
+        use_container_width=True,
+        help="Runs AI triage on every alert using current VT enrichment."
+    )
 
 # Alerts table
-st.subheader("Incoming Alerts")
 df = pd.DataFrame(st.session_state.alerts)
 st.dataframe(df, use_container_width=True)
+
+# Handle 'Run All' click
+if run_all:
+    with st.spinner("Running AI triage on all alerts..."):
+        for alert in st.session_state.alerts:
+            vt_ip = vt_enrich_ip(alert.get("ip",""))
+            vt_domain = vt_enrich_domain(alert.get("domain","")) if alert.get("domain") else {"reputation":"unknown"}
+            vt_hash = vt_enrich_hash(alert.get("hash","")) if alert.get("hash") else {"reputation":"unknown"}
+            st.session_state.results[alert["alert_id"]] = ai_triage(
+                alert,
+                vt_ip.get("reputation","unknown"),
+                vt_domain.get("reputation","unknown"),
+                vt_hash.get("reputation","unknown"),
+            )
+            st.session_state.workflow.setdefault(alert["alert_id"], {"status":"Triaged","owner":"AI","notes":[],"checklist":{}})
+            st.session_state.workflow[alert["alert_id"]]["status"] = "Triaged"
+            st.session_state.workflow[alert["alert_id"]]["owner"] = "AI"
+            st.session_state.workflow[alert["alert_id"]]["checklist"] = {
+                a: st.session_state.workflow[alert["alert_id"]]["checklist"].get(a, False)
+                for a in st.session_state.results[alert["alert_id"]].get("actions", [])
+            }
+        st.success("All triage complete.")
+    # Immediately refresh so counters & tables update and per-alert cards show results
+    try:
+        st.rerun()
+    except Exception:
+        st.experimental_rerun()
 
 # Add a single alert
 with st.expander("➕ Add New Alert"):
@@ -668,70 +954,54 @@ with st.expander("➕ Add New Alert"):
             st.success(f"Added alert {alert_id}")
             if auto_triage:
                 vt_ip = vt_enrich_ip(ip)
-                vt_domain = vt_enrich_domain(domain) if domain else {"reputation":"unknown", "status":"no_domain", "message": ""}
-                vt_hash = vt_enrich_hash(hv) if hv else {"reputation":"unknown", "status":"no_hash", "message": ""}
+                vt_domain = vt_enrich_domain(domain) if domain else {"reputation":"unknown"}
+                vt_hash = vt_enrich_hash(hv) if hv else {"reputation":"unknown"}
                 tri = ai_triage(st.session_state.alerts[-1],
                                 vt_ip.get("reputation","unknown"),
                                 vt_domain.get("reputation","unknown"),
                                 vt_hash.get("reputation","unknown"))
                 st.session_state.results[alert_id] = tri
                 st.session_state.workflow[alert_id] = {
-                    "status": "Triaged",
-                    "owner": "AI",
-                    "notes": [],
-                    "checklist": {a: False for a in tri.get("actions", [])},
-                    "escalated": tri.get("escalate", False),
-                    "escalation_reason": "",
-                    "escalation_ts": now_ts() if tri.get("escalate") else None,
+                    "status": "Triaged", "owner": "AI", "notes": [],
+                    "checklist": {a: False for a in tri.get("actions", [])}
                 }
                 st.toast(f"Auto-triaged alert {alert_id}")
+                # Immediately refresh so counters and sets update
+                try:
+                    st.rerun()
+                except Exception:
+                    st.experimental_rerun()
 
 # Per-alert cards: enrichment, AI triage, workflow
 st.subheader("Triage & Analyst Workflow")
 for alert in st.session_state.alerts:
     aid = alert["alert_id"]
-    with st.expander(f"Alert {aid}: {alert['alert_name']}"):
+    expanded = st.session_state.get("jump_to") == aid
+    with st.expander(f"Alert {aid}: {alert['alert_name']}", expanded=expanded):
+        if expanded:
+            st.session_state["jump_to"] = None
+
         st.json(alert, expanded=False)
 
         # Enrichment
         with st.spinner("Enriching (VirusTotal)..."):
             vt_ip = vt_enrich_ip(alert.get("ip",""))
-            vt_domain = vt_enrich_domain(alert.get("domain","")) if alert.get("domain") else {"status":"no_domain","reputation":"unknown","malicious":None,"suspicious":None,"harmless":None,"message":""}
-            vt_hash = vt_enrich_hash(alert.get("hash","")) if alert.get("hash") else {"status":"no_hash","reputation":"unknown","malicious":None,"suspicious":None,"harmless":None,"message":""}
+            vt_domain = vt_enrich_domain(alert.get("domain","")) if alert.get("domain") else {"status":"no_domain","reputation":"unknown","malicious":None,"suspicious":None,"harmless":None}
+            vt_hash = vt_enrich_hash(alert.get("hash","")) if alert.get("hash") else {"status":"no_hash","reputation":"unknown","malicious":None,"suspicious":None,"harmless":None}
 
         cols = st.columns(3)
         with cols[0]:
             st.markdown("**IP (VT):**")
             st.metric("Reputation", vt_ip.get("reputation","unknown").upper())
-            st.caption(
-                f"mal:{vt_ip.get('malicious')} sus:{vt_ip.get('suspicious')} har:{vt_ip.get('harmless')} "
-                f"status:{vt_ip.get('status')} | VT: {vt_ip.get('message','')}"
-            )
+            st.caption(f"mal:{vt_ip.get('malicious')} sus:{vt_ip.get('suspicious')} har:{vt_ip.get('harmless')} status:{vt_ip.get('status')}")
         with cols[1]:
             st.markdown("**Domain (VT):**")
             st.metric("Reputation", vt_domain.get("reputation","unknown").upper())
-            st.caption(
-                f"mal:{vt_domain.get('malicious')} sus:{vt_domain.get('suspicious')} har:{vt_domain.get('harmless')} "
-                f"status:{vt_domain.get('status')} | VT: {vt_domain.get('message','')}"
-            )
+            st.caption(f"mal:{vt_domain.get('malicious')} sus:{vt_domain.get('suspicious')} har:{vt_domain.get('harmless')} status:{vt_domain.get('status')}")
         with cols[2]:
             st.markdown("**Hash (VT):**")
             st.metric("Reputation", vt_hash.get("reputation","unknown").upper())
-            st.caption(
-                f"mal:{vt_hash.get('malicious')} sus:{vt_hash.get('suspicious')} har:{vt_hash.get('harmless')} "
-                f"status:{vt_hash.get('status')} | VT: {vt_hash.get('message','')}"
-            )
-
-        # Initialize workflow record if missing
-        st.session_state.workflow.setdefault(aid, {
-            "status": "New",
-            "owner": "Analyst",
-            "notes": [],
-            "checklist": {},
-            "escalated": False,
-            "escalation_reason": "",
-            "escalation_ts": None,
-        })
+            st.caption(f"mal:{vt_hash.get('malicious')} sus:{vt_hash.get('suspicious')} har:{vt_hash.get('harmless')} status:{vt_hash.get('status')}")
 
         # Run / Clear AI
         cA, cB = st.columns([1,1])
@@ -744,30 +1014,31 @@ for alert in st.session_state.alerts:
                     vt_hash.get("reputation","unknown"),
                 )
                 st.session_state.results[aid] = tri
-                wf = st.session_state.workflow[aid]
-                wf["status"] = "Triaged"
-                wf["owner"] = "AI"
-                wf["checklist"] = {a: wf["checklist"].get(a, False) for a in tri.get("actions", [])}
-                # auto-escalation hint from AI
-                if tri.get("escalate") and not wf.get("escalated"):
-                    wf["escalated"] = True
-                    wf["status"] = "Escalated"
-                    wf["escalation_reason"] = "AI suggested escalation"
-                    wf["escalation_ts"] = now_ts()
+                st.session_state.workflow.setdefault(aid, {"status":"Triaged","owner":"AI","notes":[],"checklist":{}})
+                st.session_state.workflow[aid]["status"] = "Triaged"
+                st.session_state.workflow[aid]["owner"] = "AI"
+                st.session_state.workflow[aid]["checklist"] = {
+                    a: st.session_state.workflow[aid]["checklist"].get(a, False)
+                    for a in tri.get("actions", [])
+                }
                 st.success("AI triage complete.")
+            # Optional refresh to keep counters in sync if needed:
+            try:
+                st.rerun()
+            except Exception:
+                st.experimental_rerun()
+
         if cB.button(f"🗑️ Clear AI result {aid}", key=f"clr_{aid}"):
             st.session_state.results.pop(aid, None)
             st.session_state.workflow.pop(aid, None)
             st.info("Cleared triage & workflow state for this alert.")
-            st.rerun()  # <-- FIX: rerun instead of stop so the rest of the page persists
+            try:
+                st.rerun()
+            except Exception:
+                st.experimental_rerun()
 
         # Show AI outputs + workflow controls
         tri = st.session_state.results.get(aid)
-        wf = st.session_state.workflow.get(aid, {})
-
-        # Status badges row
-        st.markdown(f"**{status_badge(wf.get('status','New'), wf.get('escalated', False))}**")
-
         if tri:
             escalate_badge = "⚠️ ESCALATE" if tri.get("escalate") else "✅ No Escalation"
             st.markdown(
@@ -781,130 +1052,51 @@ for alert in st.session_state.alerts:
             st.write("**Summary:**", tri["summary"])
 
             st.write("**Actions (Analyst Checklist):**")
-            for action, done in wf.get("checklist", {}).items():
+            for action, done in st.session_state.workflow[aid]["checklist"].items():
                 new_done = st.checkbox(action, value=done, key=f"chk_{aid}_{action}")
-                wf["checklist"][action] = new_done
+                st.session_state.workflow[aid]["checklist"][action] = new_done
 
-            # Status & escalation controls
+            status = st.session_state.workflow[aid].get("status", "New")
             needs_approval = tri.get("approval_needed", False)
-            st.write(f"**Status:** {wf.get('status','New')} | **Approval Needed:** {'Yes' if needs_approval else 'No'}")
-
-            c1, c2, c3, c4 = st.columns(4)
+            st.write(f"**Status:** {status} | **Approval Needed:** {'Yes' if needs_approval else 'No'}")
+            c1, c2, c3 = st.columns(3)
             if c1.button(f"Mark Awaiting Approval ({aid})"):
-                wf["status"] = "Awaiting Approval"
-                wf["owner"] = "Analyst"
+                st.session_state.workflow[aid]["status"] = "Awaiting Approval"
+                st.session_state.workflow[aid]["owner"] = "Analyst"
+                try:
+                    st.rerun()
+                except Exception:
+                    st.experimental_rerun()
             if c2.button(f"Approve Risky Actions ({aid})"):
-                # remove "(Approval)" prefix
                 clean_actions = [a.replace("(Approval) ", "") for a in tri.get("actions", [])]
                 tri["actions"] = clean_actions
                 tri["approval_needed"] = False
-                wf["status"] = "Triaged"
+                st.session_state.workflow[aid]["status"] = "Triaged"
+                st.session_state.results[aid] = tri  # ✅ write back explicitly
                 st.success("Approved. Actions updated.")
+                try:
+                    st.rerun()
+                except Exception:
+                    st.experimental_rerun()
             if c3.button(f"Close Alert ({aid})"):
-                wf["status"] = "Closed"
-                wf["owner"] = "Analyst"
-                st.success("Alert closed. It will also appear in the 'Closed Alerts' panel below.")
-            # Escalation with reason
-            esc_reason = c4.text_input(f"Escalation reason ({aid})", value=wf.get("escalation_reason",""), placeholder="Why escalate?")
-            if st.button(f"🚨 Escalate to Tier-2 ({aid})"):
-                wf["status"] = "Escalated"
-                wf["escalated"] = True
-                wf["owner"] = "Analyst"
-                wf["escalation_reason"] = esc_reason.strip() if esc_reason else "No reason provided"
-                wf["escalation_ts"] = now_ts()
-                st.warning("Alert escalated. It will appear in the Escalation Queue.")
+                st.session_state.workflow[aid]["status"] = "Closed"
+                st.session_state.workflow[aid]["owner"] = "Analyst"
+                st.success("Alert closed.")
+                try:
+                    st.rerun()
+                except Exception:
+                    st.experimental_rerun()
 
-            # Notes
             st.write("**Analyst Notes:**")
             note = st.text_input(f"Add note for {aid}", key=f"note_{aid}")
             if st.button(f"Add Note ({aid})"):
                 if note.strip():
-                    wf.setdefault("notes", []).append({"ts": now_ts(), "text": note.strip()})
+                    st.session_state.workflow[aid]["notes"].append({"ts": int(time.time()), "text": note.strip()})
                     st.success("Note added.")
-            for n in wf.get("notes", []):
-                st.caption(f"- {fmt_ts(n['ts'])}: {n['text']}")
+                    try:
+                        st.rerun()
+                    except Exception:
+                        st.experimental_rerun()
 
-# Batch run on all
-run_all = st.button("🔎 Run AI Triage on All (with current enrichment)")
-if run_all:
-    with st.spinner("Running AI triage on all alerts..."):
-        for alert in st.session_state.alerts:
-            vt_ip = vt_enrich_ip(alert.get("ip",""))
-            vt_domain = vt_enrich_domain(alert.get("domain","")) if alert.get("domain") else {"reputation":"unknown", "status":"no_domain", "message": ""}
-            vt_hash = vt_enrich_hash(alert.get("hash","")) if alert.get("hash") else {"reputation":"unknown", "status":"no_hash", "message": ""}
-            tri = ai_triage(
-                alert,
-                vt_ip.get("reputation","unknown"),
-                vt_domain.get("reputation","unknown"),
-                vt_hash.get("reputation","unknown"),
-            )
-            aid = alert["alert_id"]
-            st.session_state.results[aid] = tri
-            st.session_state.workflow.setdefault(aid, {"status":"Triaged","owner":"AI","notes":[],"checklist":{}, "escalated": False, "escalation_reason": "", "escalation_ts": None})
-            wf = st.session_state.workflow[aid]
-            wf["status"] = "Triaged"
-            wf["owner"] = "AI"
-            wf["checklist"] = {a: wf["checklist"].get(a, False) for a in tri.get("actions", [])}
-            if tri.get("escalate") and not wf.get("escalated"):
-                wf["status"] = "Escalated"
-                wf["escalated"] = True
-                wf["escalation_reason"] = "AI suggested escalation"
-                wf["escalation_ts"] = now_ts()
-        st.success("All triage complete.")
-
-# Escalation Queue panel
-st.subheader("Escalation Queue")
-esc_rows = []
-for aid, wf in st.session_state.workflow.items():
-    if wf.get("status") == "Escalated" or wf.get("escalated"):
-        esc_rows.append({
-            "alert_id": aid,
-            "status": wf.get("status"),
-            "reason": wf.get("escalation_reason",""),
-            "when": fmt_ts(wf.get("escalation_ts")) if wf.get("escalation_ts") else "",
-            "owner": wf.get("owner","Analyst"),
-            "open_tasks": sum(1 for x in wf.get("checklist", {}).values() if not x)
-        })
-if esc_rows:
-    st.dataframe(pd.DataFrame(esc_rows), use_container_width=True)
-else:
-    st.info("No active escalations.")
-
-# Closed Alerts panel
-st.subheader("Closed Alerts")
-closed_rows = []
-for aid, wf in st.session_state.workflow.items():
-    if wf.get("status") == "Closed":
-        closed_rows.append({
-            "alert_id": aid,
-            "closed_when": fmt_ts(wf.get("escalation_ts")) if wf.get("escalation_ts") else "",
-            "owner": wf.get("owner","Analyst"),
-            "notes": " / ".join(n.get("text","") for n in wf.get("notes", [])[:3])  # preview
-        })
-if closed_rows:
-    st.dataframe(pd.DataFrame(closed_rows), use_container_width=True)
-else:
-    st.info("No closed alerts yet.")
-
-# “What still needs a human?” panel (open actions or approvals)
-st.subheader("What still needs a human?")
-todo_rows = []
-for aid, tri in st.session_state.results.items():
-    wf = st.session_state.workflow.get(aid, {})
-    if tri.get("approval_needed") or wf.get("status") in ["Awaiting Approval", "Escalated"]:
-        todo_rows.append({
-            "alert_id": aid,
-            "status": wf.get("status", "New"),
-            "approval_needed": tri.get("approval_needed", False),
-            "escalate": wf.get("status") == "Escalated",
-            "open_tasks": sum(1 for x in wf.get("checklist", {}).values() if not x)
-        })
-if todo_rows:
-    st.dataframe(pd.DataFrame(todo_rows), use_container_width=True)
-else:
-    st.info("No items require human action right now ✅")
-
-
-
-
-
+            for n in st.session_state.workflow[aid]["notes"]:
+                st.caption(f"- {n['ts']}: {n['text']}")
