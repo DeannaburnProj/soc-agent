@@ -382,6 +382,13 @@ def vt_enrich_hash(hash_value: str) -> Dict[str, Any]:
         res = {"status": f"error_{type(e).__name__}", "reputation": "unknown", "malicious": None, "suspicious": None, "harmless": None, "raw": {}}
     cache_set(key, res); return res
 
+# NEW: friendlier captions for VT boxes
+def vt_caption(data: Dict[str, Any], missing_label: str) -> str:
+    status = data.get("status")
+    if status in ["no_ip", "no_domain", "no_hash"]:
+        return missing_label
+    return f"mal:{data.get('malicious')} sus:{data.get('suspicious')} har:{data.get('harmless')} status:{status}"
+
 # =========================
 # Guardrails / approval / escalation
 # =========================
@@ -412,12 +419,75 @@ def guardrails_and_flags(actions: List[str], severity: str, confidence: int,
             safe.append(a)
     return safe, approval_needed
 
-def auto_escalate(severity: str, confidence: int, ip_rep: str, domain_rep: str, hash_rep: str) -> bool:
-    if severity in ["high", "critical"]:
+def auto_escalate(severity: str, confidence: int,
+                  ip_rep: str, domain_rep: str, hash_rep: str) -> bool:
+    """
+    Return True when AI should *recommend* escalation to Tier 2.
+
+    This does NOT move the alert into the Escalations bucket by itself;
+    the alert only appears under Escalations when a human clicks
+    "Escalate to Tier 2" (which sets status = "Escalated to Tier 2").
+    """
+    severity = (severity or "medium").lower()
+    confidence = int(confidence or 0)
+
+    # High/Critical with good confidence -> recommend escalation
+    if severity in ("high", "critical") and confidence >= 80:
         return True
-    if any_malicious(ip_rep, domain_rep, hash_rep) and confidence >= 75:
+
+    # Any malicious reputation -> recommend escalation
+    if any_malicious(ip_rep, domain_rep, hash_rep):
         return True
+
     return False
+
+
+# NEW: decide initial workflow status from AI triage (for bulk "Run All")
+def derive_status_from_triage(tri: Dict[str, Any]) -> str:
+    """
+    Decide initial workflow status from AI result.
+
+    - If AI believes the alert is safe to close, we set
+      tri["closure_recommended"] = True and return "Awaiting Approval"
+      so a human can confirm the closure.
+    - Everything else that is still open -> "Needs Review".
+    - Nothing is auto-closed or auto-escalated into the Escalations tab.
+    """
+
+    sev = (tri.get("severity") or "medium").lower()
+    conf = int(tri.get("confidence", 0) or 0)
+
+    ip_rep = tri.get("ip_reputation", "unknown")
+    dom_rep = tri.get("domain_reputation", "unknown")
+    hash_rep = tri.get("hash_reputation", "unknown")
+
+    # "Safe-ish" reputations
+    safe_reps = all(r in ("clean", "unknown") for r in (ip_rep, dom_rep, hash_rep))
+
+    # We only recommend closure if:
+    # - AI is not recommending escalation
+    # - No risky actions needing explicit approval
+    # - Reputations aren’t malicious/suspicious
+    # - Severity is LOW/MEDIUM
+    # - Confidence reasonably high (>= 70)
+    closure_recommended = (
+        not tri.get("escalate") and
+        not tri.get("approval_needed") and
+        safe_reps and
+        sev in ("low", "medium") and
+        conf >= 70
+    )
+
+    tri["closure_recommended"] = closure_recommended
+
+    if closure_recommended:
+        # Put this into the "Awaiting Approval" bucket so a human
+        # can approve the closure.
+        return "Awaiting Approval"
+
+    # Everything else is still something a Tier-1 analyst should review.
+    return "Needs Review"
+
 
 # =========================
 # Strict JSON schema for AI (requires ip/domain/hash reputations)
@@ -692,13 +762,24 @@ if "workflow" not in st.session_state:
 
 # ---------- Top dashboard categorization helpers ----------
 def _row(alert_id: str, tri: Dict[str, Any], wf: Dict[str, Any]) -> Dict[str, Any]:
+    base_status = wf.get("status", "New")
+    status_label = base_status
+
+    # Add a visual tag for AI-recommended closures that are awaiting approval
+    if tri.get("closure_recommended") and base_status == "Awaiting Approval":
+        status_label = "Awaiting Approval (closure recommended)"
+
     return {
         "alert_id": alert_id,
-        "name": next((a["alert_name"] for a in st.session_state.alerts if a["alert_id"] == alert_id), ""),
+        "name": next(
+            (a["alert_name"] for a in st.session_state.alerts if a["alert_id"] == alert_id),
+            ""
+        ),
         "severity": tri.get("severity", "medium").upper(),
         "confidence": tri.get("confidence", 0),
-        "status": wf.get("status", "New"),
-        "summary": (tri.get("summary") or "")[:140] + ("…" if len(tri.get("summary","")) > 140 else "")
+        "status": status_label,
+        "summary": (tri.get("summary") or "")[:140]
+        + ("…" if len(tri.get("summary", "")) > 140 else ""),
     }
 
 def build_sets():
@@ -709,16 +790,28 @@ def build_sets():
 
     for aid, tri in results.items():
         wf = wf_all.get(aid, {})
-        if tri.get("escalate"):
-            escalations.append(_row(aid, tri, wf))
-        if wf.get("status") == "Awaiting Approval" or tri.get("approval_needed"):
-            awaiting.append(_row(aid, tri, wf))
-        open_tasks = sum(1 for x in wf.get("checklist", {}).values() if not x)
-        if tri.get("approval_needed") or wf.get("status") == "Awaiting Approval" or tri.get("escalate") or open_tasks > 0:
-            needs_human.append(_row(aid, tri, wf))
-        if wf.get("status") == "Closed":
-            closed.append(_row(aid, tri, wf))
+        row = _row(aid, tri, wf)
+
+        status = (wf.get("status") or "New")
+
+        # Escalations tab: ONLY things a human manually escalated
+        if status == "Escalated to Tier 2":
+            escalations.append(row)
+
+        # Awaiting Approval tab: closure recommended, waiting for human decision
+        elif status == "Awaiting Approval":
+            awaiting.append(row)
+
+        # Closed tab: explicitly closed by a human
+        elif status == "Closed":
+            closed.append(row)
+
+        # Needs Review tab: everything else that is still open
+        else:
+            needs_human.append(row)
+
     return escalations, awaiting, needs_human, closed
+
 
 # =========================
 # Human Oversight Dashboard (TOP)
@@ -789,28 +882,28 @@ c1, c2, c3, c4 = st.columns(4)
 with c1:
     st.markdown(f"""
     <div class="hod-card">
-      <div class="hod-label">⚠️ Escalations <span class="hod-chip hod-chip-esc">{len(esc)}</span></div>
+      <div class="hod-label"> Escalations <span class="hod-chip hod-chip-esc">{len(esc)}</span></div>
       <div class="hod-note">High/critical or flagged cases.</div>
     </div>
     """, unsafe_allow_html=True)
 with c2:
     st.markdown(f"""
     <div class="hod-card">
-      <div class="hod-label">📝 Awaiting Approval <span class="hod-chip hod-chip-apr">{len(await_appr)}</span></div>
+      <div class="hod-label"> Awaiting Approval <span class="hod-chip hod-chip-apr">{len(await_appr)}</span></div>
       <div class="hod-note">Actions pending analyst approval.</div>
     </div>
     """, unsafe_allow_html=True)
 with c3:
     st.markdown(f"""
     <div class="hod-card">
-      <div class="hod-label">👀 Needs Review <span class="hod-chip hod-chip-need">{len(needs)}</span></div>
+      <div class="hod-label"> Needs Review <span class="hod-chip hod-chip-need">{len(needs)}</span></div>
       <div class="hod-note">Open tasks, approvals, or escalations.</div>
     </div>
     """, unsafe_allow_html=True)
 with c4:
     st.markdown(f"""
     <div class="hod-card">
-      <div class="hod-label">✅ Closed <span class="hod-chip hod-chip-clo">{len(closed)}</span></div>
+      <div class="hod-label"> Closed <span class="hod-chip hod-chip-clo">{len(closed)}</span></div>
       <div class="hod-note">Resolved alerts (for reference).</div>
     </div>
     """, unsafe_allow_html=True)
@@ -879,6 +972,13 @@ def _list_block(rows: List[Dict[str, Any]], key_prefix: str):
             if cols[5].button("Open", key=btn_key):
                 st.session_state["jump_to"] = r["alert_id"]
                 st.toast(f"Opening alert {r['alert_id']}…")
+    # No manual rerun needed; the button click already triggers one
+
+                try:
+                    st.rerun()
+                except Exception:
+                    st.experimental_rerun()
+
 
     # Close wrapper
     st.markdown('</div>', unsafe_allow_html=True)
@@ -908,28 +1008,61 @@ st.dataframe(df, use_container_width=True)
 if run_all:
     with st.spinner("Running AI triage on all alerts..."):
         for alert in st.session_state.alerts:
-            vt_ip = vt_enrich_ip(alert.get("ip",""))
-            vt_domain = vt_enrich_domain(alert.get("domain","")) if alert.get("domain") else {"reputation":"unknown"}
-            vt_hash = vt_enrich_hash(alert.get("hash","")) if alert.get("hash") else {"reputation":"unknown"}
-            st.session_state.results[alert["alert_id"]] = ai_triage(
-                alert,
-                vt_ip.get("reputation","unknown"),
-                vt_domain.get("reputation","unknown"),
-                vt_hash.get("reputation","unknown"),
+            aid = alert["alert_id"]
+
+            # --- VT enrichment ---
+            vt_ip = vt_enrich_ip(alert.get("ip", ""))
+            vt_domain = (
+                vt_enrich_domain(alert.get("domain", ""))
+                if alert.get("domain")
+                else {"reputation": "unknown"}
             )
-            st.session_state.workflow.setdefault(alert["alert_id"], {"status":"Triaged","owner":"AI","notes":[],"checklist":{}})
-            st.session_state.workflow[alert["alert_id"]]["status"] = "Triaged"
-            st.session_state.workflow[alert["alert_id"]]["owner"] = "AI"
-            st.session_state.workflow[alert["alert_id"]]["checklist"] = {
-                a: st.session_state.workflow[alert["alert_id"]]["checklist"].get(a, False)
-                for a in st.session_state.results[alert["alert_id"]].get("actions", [])
+            vt_hash = (
+                vt_enrich_hash(alert.get("hash", ""))
+                if alert.get("hash")
+                else {"reputation": "unknown"}
+            )
+
+            # --- Run AI triage ---
+            tri = ai_triage(
+                alert,
+                vt_ip.get("reputation", "unknown"),
+                vt_domain.get("reputation", "unknown"),
+                vt_hash.get("reputation", "unknown"),
+            )
+
+            # Store AI result
+            st.session_state.results[aid] = tri
+
+            # Decide final status (never auto-close)
+            # - "Needs Review"  -> normal human review
+            # - "Awaiting Approval" -> closure recommended; human must approve
+            status = derive_status_from_triage(tri)
+
+            # Anything that isn't fully resolved by a human is owned by an analyst
+            owner = "Analyst" if status in ("Needs Review", "Awaiting Approval") else "AI"
+
+            # Initialize / update workflow entry
+            wf = st.session_state.workflow.setdefault(
+                aid,
+                {"status": status, "owner": owner, "notes": [], "checklist": {}},
+            )
+            wf["status"] = status
+            wf["owner"] = owner
+            wf["checklist"] = {
+                action: wf["checklist"].get(action, False)
+                for action in tri.get("actions", [])
             }
+
+        # DONE triaging all alerts
         st.success("All triage complete.")
+
     # Immediately refresh so counters & tables update and per-alert cards show results
     try:
         st.rerun()
     except Exception:
         st.experimental_rerun()
+
 
 # Add a single alert
 with st.expander("➕ Add New Alert"):
@@ -974,47 +1107,87 @@ with st.expander("➕ Add New Alert"):
 
 # Per-alert cards: enrichment, AI triage, workflow
 st.subheader("Triage & Analyst Workflow")
+
+# Consume the jump target ONCE for this run.
+scroll_target = st.session_state.pop("jump_to", None)
+
 for alert in st.session_state.alerts:
     aid = alert["alert_id"]
-    expanded = st.session_state.get("jump_to") == aid
-    with st.expander(f"Alert {aid}: {alert['alert_name']}", expanded=expanded):
-        if expanded:
-            st.session_state["jump_to"] = None
+    label = f"Alert {aid}: {alert['alert_name']}"
 
+    # Force-expanding ONLY the one alert we jumped to
+    if scroll_target == aid:
+        expander = st.expander(label, expanded=True)
+    else:
+        # Let Streamlit remember user-opened/closed state
+        expander = st.expander(label)
+
+    with expander:
         st.json(alert, expanded=False)
 
+        # ... your enrichment, VT, triage, workflow UI follows here ...
+
+        # -------------------
         # Enrichment
+        # -------------------
         with st.spinner("Enriching (VirusTotal)..."):
-            vt_ip = vt_enrich_ip(alert.get("ip",""))
-            vt_domain = vt_enrich_domain(alert.get("domain","")) if alert.get("domain") else {"status":"no_domain","reputation":"unknown","malicious":None,"suspicious":None,"harmless":None}
-            vt_hash = vt_enrich_hash(alert.get("hash","")) if alert.get("hash") else {"status":"no_hash","reputation":"unknown","malicious":None,"suspicious":None,"harmless":None}
+            vt_ip = vt_enrich_ip(alert.get("ip", ""))
+            vt_domain = (
+                vt_enrich_domain(alert.get("domain", ""))
+                if alert.get("domain")
+                else {
+                    "status": "no_domain",
+                    "reputation": "unknown",
+                    "malicious": None,
+                    "suspicious": None,
+                    "harmless": None,
+                }
+            )
+            vt_hash = (
+                vt_enrich_hash(alert.get("hash", ""))
+                if alert.get("hash")
+                else {
+                    "status": "no_hash",
+                    "reputation": "unknown",
+                    "malicious": None,
+                    "suspicious": None,
+                    "harmless": None,
+                }
+            )
 
         cols = st.columns(3)
         with cols[0]:
             st.markdown("**IP (VT):**")
-            st.metric("Reputation", vt_ip.get("reputation","unknown").upper())
-            st.caption(f"mal:{vt_ip.get('malicious')} sus:{vt_ip.get('suspicious')} har:{vt_ip.get('harmless')} status:{vt_ip.get('status')}")
+            st.metric("Reputation", vt_ip.get("reputation", "unknown").upper())
+            st.caption(vt_caption(vt_ip, "No IP"))
+
         with cols[1]:
             st.markdown("**Domain (VT):**")
-            st.metric("Reputation", vt_domain.get("reputation","unknown").upper())
-            st.caption(f"mal:{vt_domain.get('malicious')} sus:{vt_domain.get('suspicious')} har:{vt_domain.get('harmless')} status:{vt_domain.get('status')}")
+            st.metric("Reputation", vt_domain.get("reputation", "unknown").upper())
+            st.caption(vt_caption(vt_domain, "No Domain"))
+
         with cols[2]:
             st.markdown("**Hash (VT):**")
-            st.metric("Reputation", vt_hash.get("reputation","unknown").upper())
-            st.caption(f"mal:{vt_hash.get('malicious')} sus:{vt_hash.get('suspicious')} har:{vt_hash.get('harmless')} status:{vt_hash.get('status')}")
+            st.metric("Reputation", vt_hash.get("reputation", "unknown").upper())
+            st.caption(vt_caption(vt_hash, "No Hash"))
 
+        # -------------------
         # Run / Clear AI
-        cA, cB = st.columns([1,1])
+        # -------------------
+        cA, cB = st.columns([1, 1])
+
         if cA.button(f"🔎 Run AI on {aid}", key=f"run_{aid}"):
             with st.spinner("Contacting model..."):
                 tri = ai_triage(
                     alert,
-                    vt_ip.get("reputation","unknown"),
-                    vt_domain.get("reputation","unknown"),
-                    vt_hash.get("reputation","unknown"),
+                    vt_ip.get("reputation", "unknown"),
+                    vt_domain.get("reputation", "unknown"),
+                    vt_hash.get("reputation", "unknown"),
                 )
                 st.session_state.results[aid] = tri
-                st.session_state.workflow.setdefault(aid, {"status":"Triaged","owner":"AI","notes":[],"checklist":{}})
+                st.session_state.workflow.setdefault(
+                    aid, {"status": "Triaged", "owner": "AI", "notes": [], "checklist": {}}
+                )
                 st.session_state.workflow[aid]["status"] = "Triaged"
                 st.session_state.workflow[aid]["owner"] = "AI"
                 st.session_state.workflow[aid]["checklist"] = {
@@ -1037,7 +1210,9 @@ for alert in st.session_state.alerts:
             except Exception:
                 st.experimental_rerun()
 
+        # -------------------
         # Show AI outputs + workflow controls
+        # -------------------
         tri = st.session_state.results.get(aid)
         if tri:
             escalate_badge = "⚠️ ESCALATE" if tri.get("escalate") else "✅ No Escalation"
@@ -1051,33 +1226,61 @@ for alert in st.session_state.alerts:
             st.markdown(f"**Category:** `{tri['category']}`")
             st.write("**Summary:**", tri["summary"])
 
+            # ---------- Checklist ----------
             st.write("**Actions (Analyst Checklist):**")
             for action, done in st.session_state.workflow[aid]["checklist"].items():
                 new_done = st.checkbox(action, value=done, key=f"chk_{aid}_{action}")
                 st.session_state.workflow[aid]["checklist"][action] = new_done
 
+            # ---------- Status + flags (once, outside the loop) ----------
             status = st.session_state.workflow[aid].get("status", "New")
             needs_approval = tri.get("approval_needed", False)
-            st.write(f"**Status:** {status} | **Approval Needed:** {'Yes' if needs_approval else 'No'}")
+            closure_recommended = tri.get("closure_recommended", False)
+
+            extra_bits = []
+            if needs_approval:
+                extra_bits.append("Approval Needed")
+            if closure_recommended:
+                extra_bits.append("Closure Recommended")
+
+            extra = ""
+            if extra_bits:
+                extra = " | **" + " | ".join(extra_bits) + "**"
+
+            st.write(f"**Status:** {status}{extra}")
+
+            # ---------- Action buttons ----------
             c1, c2, c3 = st.columns(3)
-            if c1.button(f"Mark Awaiting Approval ({aid})"):
-                st.session_state.workflow[aid]["status"] = "Awaiting Approval"
+
+            if c1.button(f"Mark Needs Review ({aid})"):
+                st.session_state.workflow[aid]["status"] = "Needs Review"
                 st.session_state.workflow[aid]["owner"] = "Analyst"
                 try:
                     st.rerun()
                 except Exception:
                     st.experimental_rerun()
-            if c2.button(f"Approve Risky Actions ({aid})"):
-                clean_actions = [a.replace("(Approval) ", "") for a in tri.get("actions", [])]
-                tri["actions"] = clean_actions
-                tri["approval_needed"] = False
-                st.session_state.workflow[aid]["status"] = "Triaged"
-                st.session_state.results[aid] = tri  # ✅ write back explicitly
-                st.success("Approved. Actions updated.")
+
+            # Manual escalation to Tier 2
+            if c2.button(f"Escalate to Tier 2 ({aid})"):
+                tri["escalate"] = True
+                st.session_state.results[aid] = tri  # write back updated triage
+                st.session_state.workflow.setdefault(
+                    aid,
+                    {
+                        "status": "Escalated to Tier 2",
+                        "owner": "Tier 2",
+                        "notes": [],
+                        "checklist": {},
+                    },
+                )
+                st.session_state.workflow[aid]["status"] = "Escalated to Tier 2"
+                st.session_state.workflow[aid]["owner"] = "Tier 2"
+                st.success("Alert escalated to Tier 2.")
                 try:
                     st.rerun()
                 except Exception:
                     st.experimental_rerun()
+
             if c3.button(f"Close Alert ({aid})"):
                 st.session_state.workflow[aid]["status"] = "Closed"
                 st.session_state.workflow[aid]["owner"] = "Analyst"
@@ -1087,11 +1290,14 @@ for alert in st.session_state.alerts:
                 except Exception:
                     st.experimental_rerun()
 
+            # ---------- Analyst notes ----------
             st.write("**Analyst Notes:**")
             note = st.text_input(f"Add note for {aid}", key=f"note_{aid}")
             if st.button(f"Add Note ({aid})"):
                 if note.strip():
-                    st.session_state.workflow[aid]["notes"].append({"ts": int(time.time()), "text": note.strip()})
+                    st.session_state.workflow[aid]["notes"].append(
+                        {"ts": int(time.time()), "text": note.strip()}
+                    )
                     st.success("Note added.")
                     try:
                         st.rerun()
@@ -1100,3 +1306,4 @@ for alert in st.session_state.alerts:
 
             for n in st.session_state.workflow[aid]["notes"]:
                 st.caption(f"- {n['ts']}: {n['text']}")
+
